@@ -6,7 +6,19 @@
   之后状态置为 published。任何一步失败都不会留下半套已发布文件。
 - 失败/中断:状态置 failed,暂存与可能的半成品目录被清理;同一运行号可重试。
 - 已发布:同一运行号拒绝改写。
+
+样本号更正模型(已发布运行):
+- 磁盘文件始终以拆样时的原始组名存放,永不改名、永不重写,内容与对数不变。
+- 当前样本号存在 sample_labels 表(原始组名 -> 当前标签);一次更正可提交
+  多组 旧号->新号 映射(允许互换),在单个 SQLite 事务里校验并落库,
+  同时 runs.label_revision 加一。事务失败整体回滚,旧版标签继续供数。
+- 更正后下载地址带版本号 /runs/<id>/download/v<版本>/<文件>;旧地址一律
+  失效(410),尤其不会在互换后静默取到另一组的读段。未更正运行(v0)
+  保持 /runs/<id>/download/<文件> 的原有用法。
+- 更正与下载交错时,下载在请求开始时一次读出 (版本, 标签映射) 快照,
+  只会看到完整的一版标签;重启后映射仍在库中,更正持续有效。
 """
+import json
 import os
 import re
 import shutil
@@ -24,11 +36,13 @@ from fastapi.templating import Jinja2Templates
 from .config import db_path, published_dir, staging_dir
 from .db import db_conn, init_db
 from .demux import demultiplex
-from .samples import load_samples
+from .samples import RESERVED, SAMPLE_ID_RE, load_samples
 
 RUN_NUMBER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STATUS_LABELS = {"processing": "处理中", "published": "已发布", "failed": "失败"}
 UNDETERMINED = "undetermined"
+FASTQ_NAME_RE = re.compile(r"(.+)_R([12])\.fastq")
+VERSION_RE = re.compile(r"v([0-9]+)")
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -151,12 +165,18 @@ def process_run(run_id: int) -> None:
             if updated != 1:
                 raise RuntimeError("运行状态已变化,放弃发布")
             index_of = dict(sample_list)
+            now = utcnow()
             for sid in stats["order"]:
                 pairs, corrected = stats["counts"][sid]
                 conn.execute(
                     "INSERT INTO sample_counts(run_id, sample_id, index_seq, pairs, "
                     "corrected) VALUES (?,?,?,?,?)",
                     (run_id, sid, index_of.get(sid, ""), pairs, corrected),
+                )
+                conn.execute(  # 初始标签 = 原始组名;此后更正只改标签不动文件
+                    "INSERT INTO sample_labels(run_id, storage_id, label, updated_at) "
+                    "VALUES (?,?,?,?)",
+                    (run_id, sid, sid, now),
                 )
         _remove(staging)
     except Exception as exc:  # 任何失败:标失败 + 清半成品,不发布
@@ -269,63 +289,248 @@ def get_run_or_404(run_id: int):
     return run
 
 
-def get_counts(run_id: int):
-    with db_conn(db_path()) as conn:
-        return conn.execute(
-            "SELECT * FROM sample_counts WHERE run_id=? "
-            "ORDER BY sample_id = 'undetermined', sample_id",
+def label_map(conn, run_id: int) -> dict:
+    """当前标签 -> 存储名(原始组名)。老库兜底:无映射时按计数表自映射。"""
+    rows = conn.execute(
+        "SELECT storage_id, label FROM sample_labels WHERE run_id=?", (run_id,)
+    ).fetchall()
+    if not rows:
+        rows = conn.execute(
+            "SELECT sample_id AS storage_id, sample_id AS label "
+            "FROM sample_counts WHERE run_id=?",
             (run_id,),
         ).fetchall()
+    return {r["label"]: r["storage_id"] for r in rows}
+
+
+def get_groups(run_id: int):
+    """每组一行:当前标签、原始组名、索引、对数;未分配组排最后。"""
+    with db_conn(db_path()) as conn:
+        return conn.execute(
+            "SELECT sc.sample_id AS storage_id, "
+            "COALESCE(sl.label, sc.sample_id) AS label, "
+            "sc.index_seq, sc.pairs, sc.corrected "
+            "FROM sample_counts sc "
+            "LEFT JOIN sample_labels sl "
+            "  ON sl.run_id = sc.run_id AND sl.storage_id = sc.sample_id "
+            "WHERE sc.run_id = ? "
+            "ORDER BY COALESCE(sl.label, sc.sample_id) = 'undetermined', "
+            "COALESCE(sl.label, sc.sample_id)",
+            (run_id,),
+        ).fetchall()
+
+
+def get_corrections(run_id: int):
+    with db_conn(db_path()) as conn:
+        rows = conn.execute(
+            "SELECT revision, mapping, created_at FROM label_corrections "
+            "WHERE run_id=? ORDER BY id DESC",
+            (run_id,),
+        ).fetchall()
+    return [
+        {"revision": r["revision"], "pairs": json.loads(r["mapping"]),
+         "created_at": r["created_at"]}
+        for r in rows
+    ]
+
+
+def download_url(run, filename: str) -> str:
+    """当前有效的下载地址:更正过的运行带标签版本号,未更正保持原样。"""
+    base = f"/runs/{run['id']}/download/"
+    if run["label_revision"]:
+        base += f"v{run['label_revision']}/"
+    return base + filename
 
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
 def run_detail(request: Request, run_id: int):
     run = get_run_or_404(run_id)
-    groups = [
-        {
-            "sample_id": c["sample_id"],
+    groups = []
+    for c in get_groups(run_id):
+        r1 = f"{c['label']}_R1.fastq"
+        r2 = f"{c['label']}_R2.fastq"
+        groups.append({
+            "label": c["label"],
+            "storage_id": c["storage_id"],
             "index_seq": c["index_seq"],
             "pairs": c["pairs"],
             "corrected": c["corrected"],
-            "r1": f"{c['sample_id']}_R1.fastq",
-            "r2": f"{c['sample_id']}_R2.fastq",
-        }
-        for c in get_counts(run_id)
-    ]
+            "r1": r1,
+            "r2": r2,
+            "r1_url": download_url(run, r1),
+            "r2_url": download_url(run, r2),
+        })
     return templates.TemplateResponse(
-        request, "run.html", {"run": run, "groups": groups, "labels": STATUS_LABELS}
+        request, "run.html",
+        {
+            "run": run,
+            "groups": groups,
+            "labels": STATUS_LABELS,
+            "log_url": download_url(run, "demux.log"),
+            "corrections": get_corrections(run_id),
+        },
     )
 
 
 @app.get("/api/runs/{run_id}")
 def run_status(run_id: int):
     run = get_run_or_404(run_id)
-    counts = get_counts(run_id)
+    groups = get_groups(run_id)
     return {
         "run_number": run["run_number"],
         "status": run["status"],
         "error": run["error"],
         "total_pairs": run["total_pairs"],
+        "label_revision": run["label_revision"],
         "counts": [
-            {"sample_id": c["sample_id"], "index_seq": c["index_seq"],
-             "pairs": c["pairs"], "corrected": c["corrected"]}
-            for c in counts
+            {"sample_id": g["label"], "storage_id": g["storage_id"],
+             "index_seq": g["index_seq"], "pairs": g["pairs"],
+             "corrected": g["corrected"]}
+            for g in groups
         ],
     }
 
 
-@app.get("/runs/{run_id}/download/{filename}")
-def download(run_id: int, filename: str):
-    run = get_run_or_404(run_id)
-    if run["status"] != "published":
-        raise HTTPException(409, "运行未发布,没有完整文件可下载")
-    valid = {"demux.log"}
-    for c in get_counts(run_id):
-        valid.add(f"{c['sample_id']}_R1.fastq")
-        valid.add(f"{c['sample_id']}_R2.fastq")
-    if filename not in valid:
-        raise HTTPException(404, "文件不存在")
-    path = published_dir() / run["run_number"] / filename
+# ---------------------------------------------------------------- 样本号更正
+
+MAPPING_SEP_RE = re.compile(r"[,\s]+")
+
+
+def parse_mapping(text: str):
+    """解析多行映射:每行 '旧号,新号'(逗号或空白分隔),'#' 开头为注释。"""
+    pairs = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p for p in MAPPING_SEP_RE.split(line) if p]
+        if len(parts) != 2:
+            raise HTTPException(400, f"第 {lineno} 行格式应为:旧号,新号(逗号或空白分隔)")
+        pairs.append((parts[0], parts[1]))
+    if not pairs:
+        raise HTTPException(400, "映射为空:每行填一组 旧号,新号")
+    return pairs
+
+
+@app.post("/runs/{run_id}/relabel")
+def relabel(run_id: int, mapping: str = Form("")):
+    """一次提交多组 旧号->新号;允许两组互换。单事务校验+落库:
+    任何一步失败整体回滚,旧版标签与旧下载地址继续有效。"""
+    pairs = parse_mapping(mapping)
+    now = utcnow()
+    with db_conn(db_path()) as conn:
+        conn.execute("BEGIN IMMEDIATE")  # 校验到落库全程持写锁,防并发更正交错
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, "运行不存在")
+        if run["status"] != "published":
+            raise HTTPException(409, "只有已发布的运行才能更正样本号")
+        current = label_map(conn, run_id)  # 当前标签 -> 存储名
+
+        olds = [o for o, _ in pairs]
+        news = [n for _, n in pairs]
+        if len(set(olds)) != len(olds):
+            raise HTTPException(400, "旧号重复:同一组一次只能改成一个新号")
+        if len(set(news)) != len(news):
+            raise HTTPException(400, "新号重复:不同组不能改成同一个新号")
+        for old, new in pairs:
+            if old == UNDETERMINED:
+                raise HTTPException(400, "未分配组(undetermined)不可改名")
+            if old not in current:
+                raise HTTPException(
+                    400, f"旧号 {old!r} 不是当前有效样本号(不存在或已被更正)")
+            if old == new:
+                raise HTTPException(400, f"新号与旧号相同: {old!r}")
+            if not SAMPLE_ID_RE.fullmatch(new):
+                raise HTTPException(
+                    400, f"新号 {new!r} 无效:字母或数字开头,可含 - _ .,最长 64 字符")
+            if new.lower() in RESERVED:
+                raise HTTPException(400, f"新号 {new!r} 为保留字,不能占用未分配组名")
+        freed = set(olds)  # 参与本次更正的组名被让出,可互相占用(互换/轮转)
+        for new in news:
+            if new in current and new not in freed:
+                raise HTTPException(
+                    400, f"新号 {new!r} 与未参与本次更正的组同名,请先更正该组")
+
+        # 两步改名:先全部换成不可能合法的临时名,再落到新号,
+        # 满足 (run_id, label) 唯一索引,互换/轮转也不会中途冲突。
+        for old in olds:
+            conn.execute(
+                "UPDATE sample_labels SET label=?, updated_at=? "
+                "WHERE run_id=? AND storage_id=?",
+                ("\t" + current[old], now, run_id, current[old]),
+            )
+        for old, new in pairs:
+            conn.execute(
+                "UPDATE sample_labels SET label=?, updated_at=? "
+                "WHERE run_id=? AND storage_id=?",
+                (new, now, run_id, current[old]),
+            )
+        bumped = conn.execute(
+            "UPDATE runs SET label_revision = label_revision + 1, updated_at=? "
+            "WHERE id=? AND label_revision=?",
+            (now, run_id, run["label_revision"]),
+        ).rowcount
+        if bumped != 1:
+            raise RuntimeError("标签版本在更正期间被改动,本次更正已放弃")
+        conn.execute(
+            "INSERT INTO label_corrections(run_id, revision, mapping, created_at) "
+            "VALUES (?,?,?,?)",
+            (run_id, run["label_revision"] + 1,
+             json.dumps(pairs, ensure_ascii=False), now),
+        )
+    return RedirectResponse(f"/runs/{run_id}", status_code=303)
+
+
+# ---------------------------------------------------------------- 下载
+
+def serve_download(run_id: int, version: str | None, filename: str):
+    # 请求开始时一次读出 (运行状态, 标签版本, 标签映射) 快照:
+    # 与更正交错时,本次下载只看到完整的一版标签。
+    with db_conn(db_path()) as conn:
+        run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if run is None:
+            raise HTTPException(404, "运行不存在")
+        if run["status"] != "published":
+            raise HTTPException(409, "运行未发布,没有完整文件可下载")
+        labels = label_map(conn, run_id)
+    revision = run["label_revision"]
+
+    if version is None:
+        if revision != 0:
+            raise HTTPException(
+                410, "样本号已更正,此下载地址已失效;请从运行页获取带版本号的新链接")
+    else:
+        m = VERSION_RE.fullmatch(version)
+        if not m:
+            raise HTTPException(404, "下载地址版本无效")
+        if int(m.group(1)) != revision:
+            if int(m.group(1)) < revision:
+                raise HTTPException(
+                    410, "样本号已更正,此下载地址已失效;请从运行页获取带版本号的新链接")
+            raise HTTPException(404, "下载地址版本不存在")
+
+    if filename == "demux.log":
+        storage = filename
+    else:
+        m = FASTQ_NAME_RE.fullmatch(filename)
+        storage_id = labels.get(m.group(1)) if m else None
+        if storage_id is None:
+            raise HTTPException(404, "文件不存在")
+        storage = f"{storage_id}_R{m.group(2)}.fastq"
+    path = published_dir() / run["run_number"] / storage
     if not path.is_file():
         raise HTTPException(404, "文件不存在")
+    # 下载到本地的文件名用当前标签,磁盘上的存储名不外露
     return FileResponse(path, filename=filename, media_type="application/octet-stream")
+
+
+@app.get("/runs/{run_id}/download/{filename}")
+def download(run_id: int, filename: str):
+    """未更正运行的原始下载形式;已更正运行请用带版本号的地址。"""
+    return serve_download(run_id, None, filename)
+
+
+@app.get("/runs/{run_id}/download/{version}/{filename}")
+def download_versioned(run_id: int, version: str, filename: str):
+    return serve_download(run_id, version, filename)

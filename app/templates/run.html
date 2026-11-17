@@ -6,7 +6,8 @@
 <h2>运行 {{ run.run_number }}</h2>
 <p>状态:<span class="badge b-{{ run.status }}">{{ labels[run.status] }}</span><br>
 提交时间(UTC):{{ run.created_at }}
-{% if run.published_at %}<br>发布时间(UTC):{{ run.published_at }}{% endif %}</p>
+{% if run.published_at %}<br>发布时间(UTC):{{ run.published_at }}{% endif %}
+{% if run.label_revision %}<br>样本号标签版本:v{{ run.label_revision }}(已更正 {{ run.label_revision }} 次){% endif %}</p>
 
 {% if run.status == "failed" %}
 <p class="err">失败原因:{{ run.error }}</p>
@@ -18,18 +19,46 @@
 {% if run.status == "published" %}
 <p>总读段对:{{ run.total_pairs }}</p>
 <table>
-  <tr><th>分组</th><th>索引序列</th><th>对数</th><th>其中纠错</th><th>R1 下载</th><th>R2 下载</th></tr>
+  <tr><th>样本号(当前)</th><th>原始组名</th><th>索引序列</th><th>对数</th><th>其中纠错</th><th>R1 下载</th><th>R2 下载</th></tr>
   {% for g in groups %}
   <tr>
-    <td>{{ g.sample_id }}</td>
+    <td>{{ g.label }}</td>
+    <td>{% if g.storage_id != g.label %}{{ g.storage_id }}{% else %}—{% endif %}</td>
     <td>{{ g.index_seq or "—" }}</td>
     <td>{{ g.pairs }}</td>
     <td>{{ g.corrected }}</td>
-    <td><a href="/runs/{{ run.id }}/download/{{ g.r1 }}">{{ g.r1 }}</a></td>
-    <td><a href="/runs/{{ run.id }}/download/{{ g.r2 }}">{{ g.r2 }}</a></td>
+    <td><a href="{{ g.r1_url }}">{{ g.r1 }}</a></td>
+    <td><a href="{{ g.r2_url }}">{{ g.r2 }}</a></td>
   </tr>
   {% endfor %}
 </table>
-<p>处理日志:<a href="/runs/{{ run.id }}/download/demux.log">demux.log</a></p>
+<p>处理日志:<a href="{{ log_url }}">demux.log</a>(内容为拆样时的原始记录,不随更正改写)</p>
+
+<h3>样本号更正</h3>
+<p>发现样本号写反/写错时,在此一次提交多组映射,每行一组:<code>旧号,新号</code>
+(逗号或空白分隔,<code>#</code> 开头为注释)。两组互换请同时写两行,
+如 <code>S1,S2</code> 与 <code>S2,S1</code>。新号不得与未参与本次更正的组同名,
+也不得使用 <code>undetermined</code>;未分配组不可改名。<br>
+更正只改标签、不重跑拆分:文件内容与对数不变;提交后旧下载地址立即失效,
+请改用本页新生成的链接。</p>
+<form method="post" action="/runs/{{ run.id }}/relabel">
+  <div><textarea name="mapping" rows="4" cols="48" required
+      placeholder="S1,POOL-A&#10;S2,POOL-B"></textarea></div>
+  <div><button type="submit">提交更正</button></div>
+</form>
+
+{% if corrections %}
+<h4>更正历史</h4>
+<table>
+  <tr><th>版本</th><th>时间(UTC)</th><th>映射(旧号 → 新号)</th></tr>
+  {% for c in corrections %}
+  <tr>
+    <td>v{{ c.revision }}</td>
+    <td>{{ c.created_at }}</td>
+    <td>{% for o, n in c.pairs %}{{ o }} → {{ n }}{% if not loop.last %}; {% endif %}{% endfor %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
 {% endif %}
 {% endblock %}
